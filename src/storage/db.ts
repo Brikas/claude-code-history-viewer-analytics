@@ -100,6 +100,29 @@ function locateWasm(context: vscode.ExtensionContext): string {
   return existsSync(bundled) ? bundled : require.resolve("sql.js/dist/sql-wasm.wasm");
 }
 
+/**
+ * Publish the serialized database by writing a sibling temp file and renaming
+ * it over the target. Rename is atomic within a filesystem, so a window
+ * reading the database while another window persists sees either the previous
+ * file or the new one. Writing straight to `dbPath` truncates it first, which
+ * leaves a multi-megabyte window where readers get a torn file and
+ * `PRAGMA quick_check` fails.
+ *
+ * The pid in the temp name keeps two windows from colliding on the temp file
+ * itself.
+ */
+async function publishDatabaseFile(targetPath: string, data: Uint8Array): Promise<void> {
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  const tmpPath = `${targetPath}.tmp-${process.pid}`;
+  try {
+    await fs.writeFile(tmpPath, Buffer.from(data));
+    await fs.rename(tmpPath, targetPath);
+  } catch (err) {
+    await fs.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+}
+
 /** Serialize the in-memory DB to disk (debounced). */
 function schedulePersist(): void {
   if (!db || !dbPath) return;
@@ -108,8 +131,7 @@ function schedulePersist(): void {
     if (!db || !dbPath) return;
     const data = db.export();
     try {
-      await fs.mkdir(path.dirname(dbPath), { recursive: true });
-      await fs.writeFile(dbPath, Buffer.from(data));
+      await publishDatabaseFile(dbPath, data);
     } catch (err) {
       console.error("[claude-history] failed to persist database:", err);
     }
@@ -126,8 +148,7 @@ export async function flushDb(): Promise<boolean> {
   if (!db || !dbPath) return true;
   const data = db.export();
   try {
-    await fs.mkdir(path.dirname(dbPath), { recursive: true });
-    await fs.writeFile(dbPath, Buffer.from(data));
+    await publishDatabaseFile(dbPath, data);
     return true;
   } catch (err) {
     console.error("[claude-history] failed to flush database:", err);
