@@ -5,7 +5,7 @@ import { existsSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-  initDb, closeDb, flushDb, dbExec, getDb, sentinelPathFor,
+  initDb, closeDb, flushDb, dbExec, getDb, sentinelPathFor, renameWithRetry,
 } from "../src/storage/db.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -223,4 +223,44 @@ test("a concurrent reader never observes a partially written database", async ()
   } finally {
     await closeDb();
   }
+});
+
+/** Build an Error carrying an errno-style `code`, as fs rejections do. */
+function codedError(code: string): NodeJS.ErrnoException {
+  const err = new Error(code) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+test("rename retries the codes Windows raises while the target is held open", async () => {
+  let calls = 0;
+  await renameWithRetry("from", "to", async () => {
+    calls++;
+    if (calls < 3) throw codedError("EBUSY");
+  });
+  assert.equal(calls, 3, "must retry until the rename goes through");
+});
+
+test("rename gives up immediately on an error that retrying cannot fix", async () => {
+  let calls = 0;
+  await assert.rejects(
+    renameWithRetry("from", "to", async () => {
+      calls++;
+      throw codedError("ENOENT");
+    }),
+    /ENOENT/,
+  );
+  assert.equal(calls, 1, "a missing source must not be retried");
+});
+
+test("rename surfaces the error once the retries are exhausted", async () => {
+  let calls = 0;
+  await assert.rejects(
+    renameWithRetry("from", "to", async () => {
+      calls++;
+      throw codedError("EPERM");
+    }),
+    /EPERM/,
+  );
+  assert.equal(calls, 5, "four backoffs plus the first attempt");
 });

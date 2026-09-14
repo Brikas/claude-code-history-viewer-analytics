@@ -100,6 +100,37 @@ function locateWasm(context: vscode.ExtensionContext): string {
   return existsSync(bundled) ? bundled : require.resolve("sql.js/dist/sql-wasm.wasm");
 }
 
+/** Backoff before each rename retry, in milliseconds. */
+const RENAME_RETRY_DELAYS_MS = [10, 25, 60, 120];
+
+/** Errors Windows raises when something else still holds the target file. */
+const RENAME_RETRYABLE_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+/**
+ * Rename, retrying the codes Windows raises while another process holds the
+ * target open. Antivirus and the search indexer both take brief handles on a
+ * file just written, so a first attempt can fail on a machine where nothing is
+ * wrong. POSIX replaces the target regardless and succeeds on the first try.
+ *
+ * `rename` is injectable so the retry behaviour can be tested without a
+ * Windows host.
+ */
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  rename: (a: string, b: string) => Promise<void> = fs.rename,
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err: any) {
+      if (!RENAME_RETRYABLE_CODES.has(err?.code) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw err;
+      await new Promise((r) => setTimeout(r, RENAME_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+}
+
 /**
  * Publish the serialized database by writing a sibling temp file and renaming
  * it over the target. Rename is atomic within a filesystem, so a window
@@ -116,7 +147,7 @@ async function publishDatabaseFile(targetPath: string, data: Uint8Array): Promis
   const tmpPath = `${targetPath}.tmp-${process.pid}`;
   try {
     await fs.writeFile(tmpPath, Buffer.from(data));
-    await fs.rename(tmpPath, targetPath);
+    await renameWithRetry(tmpPath, targetPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
